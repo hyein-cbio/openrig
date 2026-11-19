@@ -123,6 +123,16 @@ specific prompt or sandbox restriction. Work within the user's chosen permission
 to unrestricted access to clear one prompt.
 For a `403` naming `untrusted_host` or `browser_origin_refused`, see [Browser access and allowed addresses](browser-access.md).
 
+### 1Password CLI works in a macOS terminal but not in a seat
+
+First verify the [1Password desktop app integration](https://www.1password.dev/cli/app-integration/)
+outside OpenRig in a local macOS terminal. Run `op vault list >/dev/null 2>&1`,
+respond only to the 1Password app's approval prompt, and record only the command's
+exit status. If it doesn't return `0`, resolve the desktop integration before
+diagnosing OpenRig. Once that check passes, repeat it in a fresh seat in a
+separate diagnostic instance. Don't copy approvals between terminals or pass
+1Password tokens through the rig spec.
+
 ### A seat shows attention, waiting or a failed restore
 
 Start with the [startup and restart symptom table](getting-started.md#incomplete-setup-and-restart). Read `rig status`
