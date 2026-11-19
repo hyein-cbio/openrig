@@ -273,8 +273,12 @@ export class RigLifecycleService {
 
     let persistedSeq = 0;
     let persistedAt = "";
+    let releasedAttachmentType: "tmux" | "external_cli" | undefined;
     const tx = this.db.transaction(() => {
       if (releasedRetry ? !isReleased() : !isCurrent()) return false;
+      const binding = this.sessionRegistry.getBindingForNode(session.node_id);
+      if (binding?.attachmentType === "tmux" && binding.tmuxSession === session.session_name) releasedAttachmentType = "tmux";
+      if (binding?.attachmentType === "external_cli" && binding.externalSessionName === session.session_name) releasedAttachmentType = "external_cli";
       this.sessionRegistry.markDetached(session.session_id);
       if (!releasedRetry) {
         this.sessionRegistry.clearBinding(session.node_id);
@@ -285,6 +289,7 @@ export class RigLifecycleService {
         rigId: session.rig_id,
         nodeId: session.node_id,
         sessionName: session.session_name,
+        ...(releasedAttachmentType ? { sessionId: session.session_id, releasedAttachmentType } : {}),
       });
       persistedSeq = event.seq;
       persistedAt = event.createdAt;
@@ -303,6 +308,7 @@ export class RigLifecycleService {
       rigId: session.rig_id,
       nodeId: session.node_id,
       sessionName: session.session_name,
+      ...(releasedAttachmentType ? { sessionId: session.session_id, releasedAttachmentType } : {}),
       seq: persistedSeq,
       createdAt: persistedAt,
     });

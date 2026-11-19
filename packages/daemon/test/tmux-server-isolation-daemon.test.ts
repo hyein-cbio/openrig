@@ -1,12 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
 import { prepareHermeticEnv, type HermeticScaffold } from "./helpers/hermetic-env.js";
 import { runRig, spawnScenarioDaemon, type ScenarioDaemon } from "./helpers/scenario-daemon.js";
 import { stageTopologyRoot } from "./helpers/scenario-stage.js";
-import type { TmuxServerSelection } from "../src/domain/tmux-server-selection.js";
+import { inspectTmuxServer, type TmuxServerSelection } from "../src/domain/tmux-server-selection.js";
+import { desktopServerExited, isDesktopServerPid, observeDesktopTmuxServer } from "../src/tmux-desktop-server.js";
 import Database from "better-sqlite3";
 import { SessionRegistry } from "../src/domain/session-registry.js";
 import { OutboxHandler } from "../src/domain/outbox-handler.js";
@@ -23,11 +24,20 @@ const nativeAvailable = process.platform !== "win32" && (() => {
   catch { return false; }
 })();
 
+const desktopAvailable = process.platform === "darwin" && (() => {
+  try {
+    execFileSync("tmux", ["-N", "-V"], { stdio: "ignore", timeout: 2_000, killSignal: "SIGKILL" });
+    return execFileSync("/bin/launchctl", ["managername"], { encoding: "utf8", timeout: 2_000, killSignal: "SIGKILL" }).trim() === "Aqua";
+  }
+  catch { return false; }
+})();
+
 describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub seat", () => {
   let scaffold: HermeticScaffold | undefined;
   let daemon: ScenarioDaemon | undefined;
   let smokeDb: Database.Database | undefined;
   const sockets = new Set<string>();
+  let desktopBootstrap: { socketPath: string; generation?: string; pid?: number; bootId?: string; startId?: string } | undefined;
   const native = (socket: string, args: string[]) => execFileSync("tmux", ["-S", socket, ...args], {
     encoding: "utf8", timeout: 10_000, stdio: ["ignore", "pipe", "pipe"],
     env: { ...scaffold!.env, PATH: process.env.PATH },
@@ -41,6 +51,26 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
       const record = join(scaffold.openrigHome, "tmux-server.json");
       if (existsSync(record)) sockets.add(JSON.parse(readFileSync(record, "utf8")).socketPath);
       const root = realpathSync(scaffold.root);
+      const bootstrapFile = join(scaffold.openrigHome, "tmux-desktop-bootstrap.json");
+      if (existsSync(bootstrapFile)) desktopBootstrap = JSON.parse(readFileSync(bootstrapFile, "utf8"));
+      if (desktopBootstrap) {
+        const { socketPath, generation, pid, bootId, startId } = desktopBootstrap;
+        if (!/^openrig-desktop-\d+-[0-9a-f]{24}\/tmux\.sock$/.test(relative(root, socketPath))) {
+          throw new Error("Refusing to clean up a desktop tmux socket outside this fixture");
+        }
+        sockets.delete(socketPath);
+        if (isDesktopServerPid(pid) && desktopServerExited(pid, bootId, startId)) {
+          if ((await inspectTmuxServer(socketPath)).state !== "absent") throw new Error(`Unknown server at ${socketPath}; fixture retained`);
+        } else {
+          const observed = await observeDesktopTmuxServer(socketPath, scaffold.openrigHome, process.getuid!(),
+            { ...scaffold.env, PATH: process.env.PATH });
+          if (observed.generation !== generation || (pid !== undefined && pid !== observed.pid)) {
+            throw new Error(`Could not verify the fixture server at ${socketPath}; fixture retained`);
+          }
+          native(socketPath, ["kill-server"]);
+          await expect.poll(() => desktopServerExited(observed.pid, observed.bootId, observed.startId), { timeout: 5_000 }).toBe(true);
+        }
+      }
       for (const socket of sockets) {
         const within = relative(root, socket);
         if (isAbsolute(within) || within === ".." || within.startsWith(`..${sep}`)) {
@@ -51,6 +81,7 @@ describe.skipIf(!nativeAvailable)("daemon tmux server selection with a real stub
       scaffold.cleanup();
     }
     sockets.clear();
+    desktopBootstrap = undefined;
     scaffold = undefined;
     daemon = undefined;
   });
@@ -183,7 +214,7 @@ if(process.argv.includes('--version')){console.log('offline-dsh');process.exit(0
     db.close(); smokeDb = undefined;
   }, 180000);
 
-  it("retains live legacy seats, migrates after down, and routes later reads, attachments and destruction to the selected server", async () => {
+  it.each(desktopAvailable ? ["isolated", "desktop"] : ["isolated"])("retains live legacy seats before migrating to %s, then routes reads, attach and destruction to the selected server", async mode => {
     scaffold = prepareHermeticEnv({ baseEnv: {
       HOME: process.env.HOME, PATH: process.env.PATH, TERM: "xterm-256color", SHELL: "/bin/sh", MOTD_SHOWN: "update-motd",
     } });
@@ -222,21 +253,52 @@ if(process.argv.includes('--version')){console.log('offline-dsh');process.exit(0
     expect(initialNodes.rows.find(row => row.canonicalSessionName === SEAT)!.tmuxServerMode).toBe("inherit");
     expect(native(personal, ["show-environment", "-t", `=${SEAT}`, "OPENRIG_HOME"]))
       .toBe(`OPENRIG_HOME=${realpathSync(scaffold.openrigHome)}`);
-    const configured = await rig(["config", "set", "terminal.tmux_server", "isolated"]);
-    expect(configured.stderr).toContain("surviving sessions keep their previous server");
-    await active.restart();
+    const desktopRequested = mode === "desktop";
+    const restart = async (desktop?: boolean) => {
+      if (desktop === undefined) return active.restart();
+      await active.sigterm();
+      await rig(["daemon", "start", "--port", String(active.port), "--db", join(scaffold!.stateDir, "scenario.db"), "--no-kernel",
+        desktop ? "--desktop-tmux" : "--no-desktop-tmux"], scaffold!.env);
+    };
+    const desktopSockets = () => readdirSync(realpathSync(scaffold!.root), { withFileTypes: true })
+      .filter(entry => entry.isDirectory() && entry.name.startsWith("openrig-desktop-"))
+      .map(entry => join(realpathSync(scaffold!.root), entry.name, "tmux.sock"));
+    if (desktopRequested) {
+      // A running daemon is neither restarted nor provisioned another server by an explicit start.
+      const daemonPid = () => JSON.parse(readFileSync(join(scaffold!.openrigHome, "daemon.json"), "utf8")).pid;
+      const pid = daemonPid();
+      const duplicate = await runRig(["daemon", "start", "--desktop-tmux", "--port", String(active.port), "--no-kernel"], scaffold.env, RIG_BIN);
+      expect(duplicate.code).not.toBe(0);
+      expect(duplicate.stderr).toContain(`Daemon already running (pid ${pid}`);
+      expect(daemonPid()).toBe(pid);
+      expect((await fetch(`${active.baseUrl}/healthz`)).ok).toBe(true);
+      expect(desktopSockets()).toEqual([]);
+    } else {
+      const configured = await rig(["config", "set", "terminal.tmux_server", "isolated"]);
+      expect(configured.stderr).toContain("surviving sessions keep their previous server");
+    }
+    await restart(desktopRequested ? true : undefined);
     expect(native(personal, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"])).toBe(oldPane);
     expect(await status()).toMatchObject({ mode: "inherit", requestedMode: "isolated", socketPath: personal,
-      migrationPending: true, blockingSessions: [SEAT] });
+      migrationPending: true, blockingSessions: [SEAT], ...(desktopRequested ? { requestedSource: "desktop" } : {}) });
+    const [desktopSocket] = desktopSockets();
+    if (desktopRequested) expect(desktopSockets()).toHaveLength(1);
+    const desktopPid = desktopSocket && native(desktopSocket, ["display-message", "-p", "#{pid}"]);
+    if (desktopRequested) desktopBootstrap = JSON.parse(readFileSync(join(scaffold.openrigHome, "tmux-desktop-bootstrap.json"), "utf8"));
     expect((await inventory()).rows.find(row => row.canonicalSessionName === SEAT)!.tmuxServerArgs).toEqual(["-S", personal]);
     expect((await rig(["capture", SEAT, "--json"])).stdout).toContain("READY");
 
     await rig(["down", "scn-baton", "--json", "--force"]);
     expect(native(personal, ["list-sessions", "-F", "#{session_name}"])).toBe("personal");
-    await active.restart();
+    await restart(desktopRequested ? true : undefined);
     const selected = await status();
     expect(selected).toMatchObject({ mode: "isolated", executionArgs: selected.serverArgs, migrationPending: false, blockingSessions: [] });
     expect(selected.socketPath).not.toBe(personal);
+    if (desktopSocket) {
+      expect(selected).toMatchObject({ requestedSource: "desktop", source: "desktop",
+        socketPath: desktopSocket, serverArgs: ["-NS", expect.stringMatching(/\/c[0-9a-f]{8}$/)] });
+      expect(native(selected.serverArgs[1]!, ["display-message", "-p", "#{pid}"])).toBe(desktopPid);
+    }
     // Restore the deliberately stopped team. The stub has no provider resume
     // history, so explicitly request a fresh seat within the same generation.
     // Fresh launches truthfully report partial restoration (CLI exit 1).
@@ -247,18 +309,22 @@ if(process.argv.includes('--version')){console.log('offline-dsh');process.exit(0
       rigResult: "partially_restored", nodes: [{ logicalId: "dev.worker", status: "fresh-primed" }] });
     expect(native(selected.socketPath!, ["list-sessions", "-F", "#{session_name}"])).toBe(SEAT);
     expect(native(personal, ["list-sessions", "-F", "#{session_name}"])).toBe("personal");
-    expect(native(selected.socketPath!, ["show-options", "-gqv", "@openrig-isolation-fixture"])).toBe("loaded");
+    expect(native(selected.socketPath!, ["show-options", "-gqv", "@openrig-isolation-fixture"])).toBe(desktopRequested ? "" : "loaded");
+    if (desktopSocket) expect(native(desktopSocket, ["display-message", "-p", "#{pid}"])).toBe(desktopPid);
     expect(native(personal, ["show-options", "-gqv", "@openrig-isolation-fixture"])).toBe("");
     const nodes = await inventory();
     expect(nodes.id).toBe(initialNodes.id);
     expect(nodes.rows).toHaveLength(1);
     expect(nodes.rows[0]!.tmuxServerArgs).toEqual(selected.serverArgs);
     expect(nodes.rows[0]!.tmuxServerMode).toBe("isolated");
-    expect(nodes.rows[0]!.tmuxAttachCommand).toContain(selected.socketPath!);
+    const [selector, selectedSocket] = selected.serverArgs as [string, string];
+    const quotedSocket = "'" + selectedSocket.replace(/'/g, "'\"'\"'") + "'";
+    const attachSocket = /^[A-Za-z0-9_@%+=:,./-]+$/.test(selectedSocket) ? selectedSocket : quotedSocket;
+    expect(nodes.rows[0]!.tmuxAttachCommand).toContain(` ${selector} ${attachSocket} `);
     const preview = await (await fetch(`${active.baseUrl}/api/terminal/preview?view=scn-baton&provider=herdr`)).json();
     expect(preview.tmux).toMatchObject({ mode: "isolated", socketPath: selected.socketPath });
     expect(preview.composed.localTmuxServer).toEqual(selected.serverArgs);
-    expect(preview.composed.opened[0].paneCommand).toContain(selected.socketPath!);
+    expect(preview.composed.opened[0].paneCommand.endsWith(` '${selector}' ${quotedSocket}`)).toBe(true);
 
     // A personal namesake must neither capture nor adopt as this instance's seat.
     native(personal, ["new-session", "-d", "-s", SEAT, "printf 'PERSONAL_NAMESAKE\\n'; sleep 600"]);
@@ -281,6 +347,12 @@ if(process.argv.includes('--version')){console.log('offline-dsh');process.exit(0
     await active.restart();
     expect(await status()).toMatchObject({ mode: "isolated", socketPath: selected.socketPath, migrationPending: false });
     expect(native(selected.socketPath!, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"])).toBe(isolatedPane);
+    if (desktopRequested) {
+      await restart(false);
+      expect(await status()).toMatchObject({ requestedMode: "inherit", source: "desktop", socketPath: selected.socketPath,
+        migrationPending: true, blockingSessions: [SEAT] });
+      expect(native(selected.socketPath!, ["display-message", "-p", "-t", `=${SEAT}:`, "#{pane_id}:#{pane_pid}"])).toBe(isolatedPane);
+    }
 
     const destroyEnv = {
       ...active.readEnv, OPENRIG_PORT: String(active.port), OPENRIG_DB: join(scaffold.stateDir, "scenario.db"),

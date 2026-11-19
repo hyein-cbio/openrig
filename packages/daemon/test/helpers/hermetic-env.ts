@@ -361,6 +361,7 @@ exec tmux -S ${shellQuote(tmuxSocketPath)} "$@"
   // The fixture owns one explicit socket; an ambient mode must not select an
   // additional server that ordinary scaffold cleanup would leave running.
   delete env.OPENRIG_TMUX_SERVER;
+  delete env.OPENRIG_TMUX_DESKTOP_SOCKET;
   delete env.RIGGED_TMUX_SERVER;
   // Inherited provider roots belong to the runner; explicit ones are test inputs.
   if (opts.baseEnv === undefined) {

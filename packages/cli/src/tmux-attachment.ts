@@ -3,7 +3,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import { hostname, networkInterfaces } from "node:os";
 import path from "node:path";
 import type { DaemonClient } from "./client.js";
-import { tmuxServerStartCommand } from "@openrig/daemon/tmux-server-start";
+import { DESKTOP_TMUX_SOCKET_FLAG, desktopServerExited, isDesktopCommandSocket, isDesktopServerPid, tmuxServerStartCommand } from "@openrig/daemon/tmux-server-start";
 
 export interface TmuxAttachment {
   session: string;
@@ -15,33 +15,40 @@ export interface TmuxAttachment {
 export function readTmuxServerArgs(value: unknown): string[] {
   if (value === undefined) return []; // Compatibility with a daemon predating server metadata.
   if (!Array.isArray(value) || (value.length !== 0 && (value.length !== 2
-    || (value[0] !== "-S" && value[0] !== "-L")
-    || typeof value[1] !== "string" || !value[1] || value[1].includes("\0")))) {
+    || (value[0] !== "-S" && value[0] !== "-L" && value[0] !== DESKTOP_TMUX_SOCKET_FLAG)
+    || typeof value[1] !== "string" || !value[1] || value[1].includes("\0")
+    || (value[0] === DESKTOP_TMUX_SOCKET_FLAG && (!path.isAbsolute(value[1]) || /[\x00-\x1f\x7f]/.test(value[1])))))) {
     throw new Error("The daemon returned invalid tmux server options.");
   }
   return [...value] as string[];
 }
 
 /** Offline cleanup pins only active isolation/migration; ordinary inherit uses tmux's environment. */
-export function readRecordedTmuxServerArgs(home: string): string[] {
-  let record: { version?: unknown; home?: unknown; mode?: unknown; socketPath?: unknown; isolatedSocketPath?: unknown; pinned?: unknown } | null = null;
+export function readRecordedTmuxServerArgs(home: string): string[] | null {
+  let record: { version?: unknown; home?: unknown; mode?: unknown; socketPath?: unknown; isolatedSocketPath?: unknown; pinned?: unknown; desktopServerPid?: unknown; desktopCommandSocket?: unknown; desktopBootId?: string; desktopStartId?: string } | null = null;
   let readError: unknown;
   try { record = JSON.parse(readFileSync(path.join(home, "tmux-server.json"), "utf8")); }
   catch (error) { readError = error; }
-  const pinned = record?.mode === "isolated" || record?.pinned === true;
+  const desktop = record?.version === 2;
+  const pinned = desktop || record?.mode === "isolated" || record?.pinned === true;
   let matchesHome = false;
   try { matchesHome = record?.home === realpathSync(home); } catch { /* A missing/unreadable home is not a valid record. */ }
-  const valid = record?.version === 1 && matchesHome
+  const valid = record && (desktop || record.version === 1) && matchesHome
     && (record.mode === "inherit" || record.mode === "isolated")
     && (record.pinned === undefined || typeof record.pinned === "boolean")
     && !(record.mode === "isolated" && record.pinned === false)
     && typeof record.socketPath === "string" && path.isAbsolute(record.socketPath) && !record.socketPath.includes("\0")
+    && (!desktop || (record.mode === "isolated" && isDesktopServerPid(record.desktopServerPid)
+      && isDesktopCommandSocket(record.socketPath, record.desktopCommandSocket)))
     && (record.isolatedSocketPath === undefined || (typeof record.isolatedSocketPath === "string"
       && path.isAbsolute(record.isolatedSocketPath) && !record.isolatedSocketPath.includes("\0")));
   if (valid) {
     // An explicit opt-out record is committed before the marker is removed.
     // Older inherit records are advisory too, never a remembered cleanup socket.
-    return pinned ? readTmuxServerArgs(["-S", record!.socketPath]) : [];
+    if (desktop && isDesktopServerPid(record!.desktopServerPid)
+        && desktopServerExited(record!.desktopServerPid, record!.desktopBootId, record!.desktopStartId)) return null;
+    return pinned ? readTmuxServerArgs(desktop
+      ? [DESKTOP_TMUX_SOCKET_FLAG, record!.desktopCommandSocket] : ["-S", record!.socketPath]) : [];
   }
 
   let marked = false;

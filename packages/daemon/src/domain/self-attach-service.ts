@@ -8,6 +8,7 @@ import type { TmuxAdapter } from "../adapters/tmux.js";
 import type { TranscriptStore } from "./transcript-store.js";
 import { startTmuxTranscriptCapture } from "./transcript-capture.js";
 import { realpathSync } from "node:fs";
+import { sameSocketInode } from "./tmux-server-selection.js";
 import { resolve } from "node:path";
 
 export type SelfAttachSuccess = {
@@ -51,7 +52,7 @@ interface SelfAttachServiceDeps {
   sessionRegistry: SessionRegistry;
   eventBus: EventBus;
   tmuxAdapter?: TmuxAdapter;
-  tmuxServer?: { socketPath?: string; mode: "inherit" | "isolated" };
+  tmuxServer?: { socketPath?: string; mode: "inherit" | "isolated"; source?: "desktop"; serverArgs?: readonly string[] };
   transcriptStore?: TranscriptStore;
   claudeContextProvisioner?: {
     ensureContextCollector(binding: { cwd?: string | null; tmuxSession?: string | null }): void;
@@ -224,7 +225,12 @@ export class SelfAttachService {
     const expected = this.tmuxServer?.socketPath;
     if (this.tmuxServer?.mode !== "isolated" || !expected || context?.attachmentType !== "tmux") return;
     const canonical = (file: string) => { try { return realpathSync(file); } catch { return resolve(file); } };
-    if (context.tmuxSocketPath && canonical(context.tmuxSocketPath) === canonical(expected)) return;
+    if (context.tmuxSocketPath) {
+      if (this.tmuxServer.source === "desktop") {
+        const commandSocket = this.tmuxServer.serverArgs?.[1];
+        if (commandSocket && sameSocketInode(context.tmuxSocketPath, commandSocket)) return;
+      } else if (canonical(context.tmuxSocketPath) === canonical(expected)) return;
+    }
     return { ok: false, code: "tmux_server_mismatch", error: context.tmuxSocketPath
       ? "This shell uses a different tmux server. Open a shell on the server reported by rig terminal status before attaching it."
       : "This instance uses an isolated tmux server. Update the CLI so attach --self can report this shell's socket." };

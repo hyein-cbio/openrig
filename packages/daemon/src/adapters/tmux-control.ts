@@ -4,6 +4,7 @@ import { constants } from "node:fs";
 import { open } from "node:fs/promises";
 import { spawnTmuxClient, TMUX_MAX_BUFFER } from "./tmux-exec.js";
 import type { ArgvExecFn } from "./tmux.js";
+import { DESKTOP_TMUX_SOCKET_FLAG } from "../tmux-server-start.js";
 
 /**
  * tmux commands over one long-lived control-mode client (`tmux -C`) instead of a new tmux client per command. Opt-in:
@@ -687,7 +688,7 @@ export function tmuxControlExec(fallback: ArgvExecFn, options: TmuxControlOption
     const [bin, ...argsIn] = argvIn;
     // Only the leading global server pair is a selection: capture-pane's own -S is a scrollback bound.
     // A different server (or any other global flags) belongs to a spawned client, unchanged.
-    const prefix = argsIn.length >= 2 && (argsIn[0] === "-S" || argsIn[0] === "-L") ? argsIn.slice(0, 2) : [];
+    const prefix = argsIn.length >= 2 && ["-S", "-L", DESKTOP_TMUX_SOCKET_FLAG].includes(argsIn[0]!) ? argsIn.slice(0, 2) : [];
     const sameServer = prefix.length === serverArgs.length && prefix.every((arg, i) => arg === serverArgs[i]);
     // A short one-line text's load-buffer is sent as set-buffer; a spawned client, if one runs it, gets the load-buffer.
     // The file is read only once a control client is there to take the set-buffer (N1 of the review): without one, the

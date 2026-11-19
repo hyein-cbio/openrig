@@ -55,8 +55,8 @@ leave startup using one server and offline cleanup selecting another. A valid
 unpinned record takes precedence over a leftover marker. Legacy inherited records
 and the old `1` marker do not make ordinary inheritance depend on that file.
 
-A newly started server loads tmux's normal system and user configuration,
-including `~/.tmux.conf`; OpenRig does not substitute an empty configuration.
+Ordinary server creation loads tmux's normal system and user configuration,
+including `~/.tmux.conf`. Desktop bootstrap instead uses a minimal config, as described below.
 Existing OpenRig session options, such as `terminal.status_bar`, still apply.
 An existing server does not reread its configuration merely because the daemon
 restarts. Settings and sessions in a separate personal server are left alone.
@@ -92,6 +92,87 @@ candidate comes from the launching environment. If live seats use a non-default
 server, start the upgraded daemon from that original server to establish its
 record, or stop those seats before changing servers. Earlier versions did not
 persist enough information to find an arbitrary old socket from a different shell.
+
+## Start OpenRig's tmux server from your macOS desktop terminal
+
+From a local macOS desktop terminal, outside tmux and SSH, run:
+
+```sh
+rig daemon start --desktop-tmux
+rig terminal status --json
+rig tui
+```
+
+No terminal plugin or environment handoff is required. With a tmux binary that
+supports `-N`, the OpenRig CLI starts or verifies a private server from the
+calling terminal, before spawning the detached daemon. A new server requires a
+confirmed macOS GUI login context (`Aqua`). The server uses a minimal
+config instead of `~/.tmux.conf` and a minimal shell environment, under `/tmp`
+(or a short, trusted `TMUX_TMPDIR`; directories with allow ACLs are refused).
+OpenRig refuses to replace an unrecognized or stale socket. `tmux.source: "desktop"`
+and `migrationPending: false` confirm selection; `requestedSource` alone does not.
+Once selected, commands use a private link to the verified socket inode, so a
+replacement at the bootstrap path is not mistaken for the original server.
+Clients won't recreate a lost server. To recover, stop the daemon deliberately and make sure
+no other launcher is starting it. A missing socket alone does not prove the
+server exited. OpenRig uses the recorded tmux PID and, when available, its
+process start time and the macOS boot ID. If OpenRig reports that the recorded tmux PID may still exist,
+verify its identity first. Check that the recorded socket's parent directory exists;
+if missing, restore it with the expected ownership and private permissions.
+For the confirmed live server, use tmux's documented socket recovery (`SIGUSR1`).
+Recheck the exact bootstrap path immediately before signaling; stop if it is
+occupied. Do not signal an unconfirmed or unrelated process. After recovery,
+check `tmux -NS '<socketPath>' display-message -p '#{pid}'` using the bootstrap
+path and confirm it reports the original PID. Run `rig daemon start --desktop-tmux`
+to re-establish the private command link, then check `rig terminal status --json`
+and `rig ps --nodes` to confirm the original seats are visible.
+
+After confirming that the old process exited and its socket is missing, start
+with `--desktop-tmux` from a local desktop terminal. OpenRig uses the recorded
+socket even if `TMUX_TMPDIR` has changed, unless its parent directory is gone and
+the recorded process has exited. If an interrupted bootstrap didn't
+record a PID and the socket is missing, OpenRig refuses to guess. Before retrying,
+archive only `tmux-desktop-bootstrap.json` in the instance home if you have
+confirmed that the attempted process did not start or has exited **and** that
+`tmux-server.json` does not identify a live desktop server. If uncertain, preserve
+both records and the daemon log and leave the state unchanged.
+If the socket still exists, check it with `tmux -NS '<socketPath>' list-sessions`
+and look for an owner of that exact path in `lsof -nP -U`. Remove only a confirmed
+stale socket before retrying: a refused connection and no live owner. If you
+cannot establish both (for example, a permission error), leave it in place.
+
+`Open Terminals` and `rig terminal attach` keep their ordinary behavior: they
+attach viewers to existing seats, not start seats or change their startup
+context. Desktop selection affects only the local server; SSH tiles still follow
+`terminal.tmux_server`. That setting's `isolated` mode alone still starts tmux
+from the daemon; it is not a desktop authentication fix.
+
+Starting with the option never restarts an already-running daemon. When a
+requested switch is deferred, the TUI keeps using the previous server and explains why.
+If inspection failed, restore access to the previous socket. Run `rig daemon stop`,
+then `rig daemon start --desktop-tmux` and check `rig terminal status --json` to
+confirm the session inventory before acting on seats.
+If `blockingSessions` lists live seats, approve downtime before stopping the affected
+rigs with `rig down <rig>`. If it releases a claimed session, have its owner stop
+it, then run `rig down <rig>` again against the old server to record the stop.
+Run `rig daemon stop`, then `rig daemon start --desktop-tmux` from your local
+desktop terminal. Verify the selection before restoring with `rig up <rig> --existing`.
+If a legacy instance has no socket record, first boot the updated daemon on the
+original server without the desktop option. A legacy record identifies a path,
+not the server process. An empty inventory does not clear registered seats:
+restore the original socket if needed, then reconcile those seats on the original
+server or verify the server exited before reconciling their registrations. To opt out or before downgrading,
+run `rig daemon stop`, then `rig daemon start --no-desktop-tmux` outside the
+desktop server. Check `rig terminal status --json`: do not downgrade while
+`tmux.source` is `desktop` or `migrationPending` is `true`. If live seats defer
+opt-out, deliberately stop the affected rigs, stop the daemon, then start with
+`--no-desktop-tmux` again and recheck before downgrading.
+
+The server marker identifies the OpenRig home, not the GUI app or 1Password
+access. OpenRig copies no approvals or tokens; 1Password handles approval
+normally. To verify the path, use a separate diagnostic instance and check only
+the exit status of `op vault list >/dev/null` in its seat. Let the operator handle
+any approval prompt.
 
 ## Moving an existing team onto tmux control mode
 

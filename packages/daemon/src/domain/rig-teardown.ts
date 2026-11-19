@@ -17,6 +17,7 @@ import { communityHarnessOf } from "./built-in-runtimes.js";
 import { SEAT_SKILLS_BOOTSTRAP_BLOCK_ID, SEAT_SKILLS_BOOTSTRAP_LINE, cleanSeatSkills, seatSkillPaths } from "./seat-skill-storage.js";
 import { settleAutomaticRestore } from "./existing-rig-restore.js";
 import { resolveSeatKind, seatProcessOwner } from "./seat-kinds.js";
+import { RELEASED_ATTACHMENT_KIND_SQL } from "./released-attachment-kind.js";
 
 export interface TeardownResult {
   rigId: string;
@@ -70,6 +71,7 @@ interface TeardownDeps {
   serviceOrchestrator?: import("./service-orchestrator.js").ServiceOrchestrator;
   /** The shipped Claude context collector. A cwd's copy is removed only while its bytes match this file. */
   claudeCollectorAssetPath?: string;
+  confirmDesktopServerExit?: () => boolean;
   /** Releases a claimed session's seat without stopping the session: `rig unclaim`'s own path. Absent: such a session
    *  goes through the marker-checked stop, as before. */
   releaseClaimedSession?: (sessionId: string) => Promise<{ ok: true } | { ok: false; error: string }>;
@@ -389,21 +391,28 @@ export class RigTeardownOrchestrator {
     const probe = this.deps.tmuxAdapter.probeSession;
     if (!probe) return;
     const eligible = this.db.prepare(`
-      SELECT s.id, s.node_id, s.session_name, s.status FROM sessions s JOIN nodes n ON n.id = s.node_id
+      SELECT s.id, s.node_id, s.session_name, s.status, s.origin, ${RELEASED_ATTACHMENT_KIND_SQL} AS released_kind
+      FROM sessions s JOIN nodes n ON n.id = s.node_id
       WHERE n.rig_id = ? AND s.status IN ('exited', 'detached', 'superseded')
         AND s.intentionally_stopped = 0
+        AND COALESCE(${RELEASED_ATTACHMENT_KIND_SQL}, 'unknown') <> 'external_cli'
         AND s.id = (SELECT latest.id FROM sessions latest WHERE latest.node_id = n.id
           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
     `);
-    for (const row of eligible.all(rigId) as Array<{ id: string; node_id: string; session_name: string; status: string }>) {
+    for (const row of eligible.all(rigId) as Array<{ id: string; node_id: string; session_name: string; status: string; origin?: string; released_kind?: string }>) {
       const binding = this.deps.sessionRegistry.getBindingForNode(row.node_id);
       if (binding && (binding.attachmentType !== "tmux" || binding.tmuxSession !== row.session_name)) continue;
+      if (!binding && this.deps.confirmDesktopServerExit && row.status === "detached" && row.origin === "claimed"
+          && row.released_kind !== "tmux") continue;
       const stillEligible = () => (eligible.all(rigId) as Array<{ id: string }>).some(current => current.id === row.id)
         && JSON.stringify(this.deps.sessionRegistry.getBindingForNode(row.node_id)) === JSON.stringify(binding);
       try {
         let observed = await probe.call(this.deps.tmuxAdapter, row.session_name);
         if (!stillEligible()) continue;
-        if (isMissingTmuxServer(observed)) {
+        // Process exit proves absence only for a current tmux binding, not an unbound historical claim.
+        if (binding?.attachmentType === "tmux" && observed.state === "transport_unavailable" && this.deps.confirmDesktopServerExit?.()) {
+          observed = { state: "absent" };
+        } else if (isMissingTmuxServer(observed)) {
           // A reboot may have removed tmux's server/socket. Start only an empty server, then
           // demand positive session absence; transport_unavailable itself proves nothing.
           const started = await this.deps.tmuxAdapter.startServer();
@@ -431,6 +440,7 @@ export class RigTeardownOrchestrator {
     const earlier = this.db.prepare(`
       SELECT s.id, s.session_name FROM sessions s JOIN nodes n ON n.id = s.node_id
       WHERE n.rig_id = ? AND s.origin = 'claimed' AND s.status = 'detached' AND s.intentionally_stopped = 0
+        AND ${this.deps.confirmDesktopServerExit ? `${RELEASED_ATTACHMENT_KIND_SQL} = 'tmux'` : `COALESCE(${RELEASED_ATTACHMENT_KIND_SQL}, 'unknown') <> 'external_cli'`}
         AND s.id <> (SELECT latest.id FROM sessions latest WHERE latest.node_id = n.id
           ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1)
     `).all(rigId) as Array<{ id: string; session_name: string }>;

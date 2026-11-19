@@ -187,6 +187,8 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     .option("--port <port>", "Port to listen on")
     .option("--host <host>", "Host to bind on")
     .option("--db <path>", "Database path")
+    .option("--desktop-tmux", "Start or reuse a private tmux server from this local macOS desktop terminal")
+    .option("--no-desktop-tmux", "Return to the configured tmux selection once desktop seats have stopped")
     .option("--allow-db-conflict", "Proceed for this start when another live daemon is confirmed using the database")
     // V0.3.1 slice 05 kernel-rig-as-default — skip the kernel auto-boot
     // path. Used by test fixtures, headless CI, and operators who want
@@ -202,8 +204,9 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
     // weaker "daemon-ready". Default 60s; override with --wait-for-kernel-ms.
     .option("--wait-for-kernel", "After daemon binds, also wait for kernel-agent readiness (default timeout 60s)")
     .option("--wait-for-kernel-ms <ms>", "Override --wait-for-kernel timeout in milliseconds")
-    .action(async (opts: { port?: string; host?: string; db?: string; allowDbConflict?: boolean; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
+    .action(async (opts: { port?: string; host?: string; db?: string; allowDbConflict?: boolean; desktopTmux?: boolean; kernel?: boolean; waitForKernel?: boolean; waitForKernelMs?: string }) => {
       try {
+        if (opts.desktopTmux !== undefined && process.platform !== "darwin") throw new Error("Desktop tmux selection is supported only on macOS.");
         const { ConfigStore } = await import("../config-store.js");
         const { SystemPreflight, quietPreflightExec } = await import("../system-preflight.js");
         const configStore = new ConfigStore();
@@ -273,10 +276,12 @@ export function daemonCommand(depsOverride?: LifecycleDeps): Command {
             // check in startup.ts honors the flag.
             skipKernelBoot: skipKernel,
             allowDbConflict: opts.allowDbConflict,
+            desktopTmux: opts.desktopTmux,
           },
           getDeps(),
         );
         console.log(`Daemon started on port ${state.port} (pid ${state.pid})`);
+        if (opts.desktopTmux !== undefined) console.log("Check rig terminal status --json for the selected server. Existing seats may defer the switch.");
         // The daemon leaves a workspace.root that holds a project of its own as it is, and its log says so; so does this
         // output, from the same read-only check.
         const workspace = ensureDefaultWorkspace({ root: config.workspace.root, dryRun: true });

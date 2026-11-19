@@ -19,10 +19,15 @@ import { terminalRoutes } from "../../daemon/src/routes/terminal.js";
 import { TerminalService } from "../../daemon/src/domain/terminal/terminal-service.js";
 import { HERDR_PANES_PER_PAGE } from "../../daemon/src/domain/terminal/herdr-adapter.js";
 import type { TerminalProvider } from "../../daemon/src/domain/terminal/terminal-provider.js";
+import { setDaemonTmuxServer } from "../../daemon/src/adapters/tmux-server.js";
 
 vi.mock("../src/local-origin.js", () => ({ readLocalOrigin: () => "window-fixture" }));
 
 const env = { ...process.env }; delete env["TMUX"];
+const desktopSupported = (() => {
+  try { execFileSync("tmux", ["-N", "-V"], { env, stdio: "ignore", timeout: 2_000, killSignal: "SIGKILL" }); return true; }
+  catch { return false; }
+})();
 const sockets: string[] = [];
 const dirs: string[] = [];
 const servers: Array<{ close(): void }> = [];
@@ -30,12 +35,13 @@ function tmux(socket: string, args: string[]): string {
   return execFileSync("tmux", ["-L", socket, "-f", "/dev/null", ...args], { encoding: "utf8", env, timeout: 5000 });
 }
 afterEach(() => {
+  setDaemonTmuxServer([]);
   for (const server of servers.splice(0)) server.close();
   for (const socket of sockets.splice(0)) { try { tmux(socket, ["kill-server"]); } catch { /* already gone */ } }
   for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function fixture(herdrAvailable: boolean) {
+async function fixture(herdrAvailable: boolean, selection?: "desktop" | "pending") {
   const id = randomUUID().slice(0, 12);
   const source = `src-${id}`, viewer = `view-${id}`;
   sockets.push(source, viewer);
@@ -47,6 +53,11 @@ async function fixture(herdrAvailable: boolean) {
   for (const seat of seats) tmux(source, ["new-session", "-d", "-s", seat, "sleep 120"]);
   tmux(viewer, ["new-session", "-d", "-s", "viewer-fixture", "sleep 120"]);
   tmux(viewer, ["set-option", "-g", "default-size", "120x40"]);
+  const socketPath = selection ? tmux(source, ["display-message", "-p", "#{socket_path}"]).trim() : undefined;
+  const serverArgs = socketPath ? [selection === "desktop" ? "-NS" : "-S", socketPath] : [];
+  if (selection) setDaemonTmuxServer(serverArgs, { requestedMode: "isolated", requestedSource: "desktop", socketPath,
+    serverArgs, executionArgs: serverArgs, ...(selection === "desktop" ? { mode: "isolated", source: "desktop",
+      migrationPending: false, blockingSessions: [] } : { mode: "inherit", migrationPending: true, blockingSessions: seats }) });
   const providerOpens: string[] = [];
   const provider = (name: string, available: boolean, panesPerPage?: number): TerminalProvider => ({
     name, ...(panesPerPage ? { panesPerPage } : {}),
@@ -64,6 +75,7 @@ async function fixture(herdrAvailable: boolean) {
     viewsStore: { get: viewId => (viewId === "fixture" ? saved : null), list: () => [saved] },
     listRigSeats: () => null, listPodSeats: () => null, listScopeSeats: () => null, listRigNames: () => [],
     resolveHost: () => null, hasSession: () => true, resolveLocalTmux: () => wrapper,
+    tmuxServerArgs: () => serverArgs,
   } as ConstructorParameters<typeof TerminalService>[0]);
   const app = new Hono();
   app.get("/healthz", c => c.json({ selfHostId: "window-fixture" }));
@@ -86,8 +98,9 @@ async function fixture(herdrAvailable: boolean) {
     },
     launch: async () => {}, sleep: async () => {}, id: () => id,
   };
-  const viewCreated = () => tmux(viewer, ["list-sessions", "-F", "#{session_name}"]).split("\n").includes(`openrig-view-${id}`);
-  return { baseUrl, saved, deps, launched, providerOpens, viewCreated };
+  const sessions = (socket: string) => tmux(socket, ["list-sessions", "-F", "#{session_name}"]).trim().split("\n");
+  const viewCreated = () => sessions(socketPath ? source : viewer).includes(`openrig-view-${id}`);
+  return { baseUrl, saved, deps, launched, providerOpens, viewCreated, socketPath, otherSessions: () => sessions(viewer) };
 }
 
 it("with no Herdr and a live cmux, Open terminals reaches the plain-tmux window", async () => {
@@ -98,6 +111,35 @@ it("with no Herdr and a live cmux, Open terminals reaches the plain-tmux window"
   expect(f.viewCreated()).toBe(true);
   expect(f.launched).toHaveLength(1);
   expect(f.providerOpens).toEqual([]);
+});
+
+it.skipIf(!desktopSupported)("passes the launcher-owned endpoint through the TUI preview and tmux viewer, without using another server", async () => {
+  const f = await fixture(false, "desktop");
+  const preview = await new TuiClient({ baseUrl: f.baseUrl }).previewTerminal("saved:fixture");
+  expect(preview).toMatchObject({ tmux: { source: "desktop", migrationPending: false } });
+  const result = await openTerminalWindow(new CliClient(f.baseUrl), "saved:fixture", undefined, f.deps, preview.planId);
+  expect(result, JSON.stringify(result)).toMatchObject({ ok: true, provider: "tmux", opened: ["seat0", "seat1"] });
+  expect(f.viewCreated()).toBe(true);
+  expect(f.otherSessions()).toEqual(["viewer-fixture"]);
+  expect(f.launched).toHaveLength(1);
+  expect(f.launched[0]).toContain("-NS");
+  expect(f.launched[0]).toContain(f.socketPath!);
+  expect(result.notes?.join("\n")).not.toContain("switch is deferred");
+});
+
+it("keeps existing attachments and explains a deferred switch without a launcher environment", async () => {
+  const f = await fixture(false, "pending");
+  const client = new CliClient(f.baseUrl);
+  const preview = await new TuiClient({ baseUrl: f.baseUrl }).previewTerminal("saved:fixture");
+  const result = await openTerminalWindow(client, "saved:fixture", undefined, f.deps, preview.planId);
+  expect(result).toMatchObject({ ok: true, opened: ["seat0", "seat1"] });
+  expect(result.notes?.join("\n")).toMatch(/switch is deferred: live seats.*\n[\s\S]*rig daemon start --desktop-tmux/);
+  expect(f.viewCreated()).toBe(true);
+  expect(f.otherSessions()).toEqual(["viewer-fixture"]);
+  expect(f.launched[0]).toContain(f.socketPath!);
+  const direct = await client.post<typeof result>("/api/terminal/open", { view: "saved:fixture", provider: "cmux" });
+  expect(direct.data).toMatchObject({ ok: true, opened: ["seat0", "seat1"] });
+  expect(direct.data.notes?.join("\n")).toContain("switch is deferred: live seats");
 });
 
 it("with Herdr available, the TUI preview's plan is the one the window opener checks, as before", async () => {

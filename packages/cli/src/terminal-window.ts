@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { promisify } from "node:util";
-import { reportTmuxServerLimit, tmuxServerStartCommand } from "@openrig/daemon/tmux-server-start";
+import { desktopTmuxMigrationNotes, reportTmuxServerLimit, tmuxServerStartCommand, type DesktopTmuxMigration } from "@openrig/daemon/tmux-server-start";
 import { encodeTmuxViewerProof, parseTmuxViewerProof, TMUX_VIEWER_PROOF_OPTION, qualifiesTmuxViewer, tmuxViewerCloseArgs, TMUX_VIEWER_OPTION_SNAPSHOT, TMUX_VIEWER_KEPT } from "@openrig/daemon/terminal-viewer-guard";
 import { terminalAuthHeaders, type DaemonClient } from "./client.js";
 import { shellQuote } from "./cross-host-executor.js";
@@ -18,7 +18,7 @@ interface Pane { seat: string; label: string; paneCommand: string; recoveryComma
 interface Preview {
   planId: string;
   session?: string;
-  tmux?: { mode: "inherit" | "isolated"; serverArgs?: readonly string[] };
+  tmux?: DesktopTmuxMigration & { mode: "inherit" | "isolated"; serverArgs?: readonly string[] };
   status: { launch?: { socketPath: string; session?: string }; providers?: Array<{ liveness?: { alive?: boolean }; status?: { launch?: { socketPath?: string } } }> };
   rigViewer?: boolean;
   viewDescriptor?: { kind?: "following" | "fixed"; name?: string };
@@ -514,6 +514,9 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     if (session !== undefined && (preview.data.session !== session || preview.data.status.launch?.session !== session || !preview.data.status.launch.socketPath)) {
       return failed("The daemon did not confirm the requested Herdr session. Update the daemon before opening a named session.");
     }
+    const migrationNoteOffset = windowNotes.length;
+    let migrationNotes = desktopTmuxMigrationNotes(preview.data.tmux);
+    windowNotes.push(...migrationNotes);
     const launchTarget = preview.data.status.launch;
     let { composed, planId, remote } = preview.data;
     await assertLocalTmux(client, preview.data.tmux?.mode, "The window launcher must run on the daemon's own desktop; its instance identity could not be confirmed locally.");
@@ -521,7 +524,8 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
     if (expectedPlan !== undefined && expectedPlan !== planId) {
       return failure(provider, "The terminal view changed since preview. Refresh the preview before opening.");
     }
-    if (!composed.opened.length && !following) return { ...failed("No conversations are attachable."), absent: composed.absent, degraded: composed.degraded };
+    if (!composed.opened.length && !following) return { ...failed("No conversations are attachable."),
+      absent: composed.absent, degraded: composed.degraded, ...(windowNotes.length ? { notes: windowNotes } : {}) };
     const measureWindow = async () => {
       if (window && "columns" in window && window.columns !== viewportColumns && composed.kernelLayout) {
         viewportColumns = window.columns;
@@ -536,6 +540,9 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
           throw new Error("The daemon's tmux server changed while opening the window; refresh the preview before retrying.");
         }
         ({ composed, planId, remote } = next.data);
+        const refreshedNotes = desktopTmuxMigrationNotes(next.data.tmux);
+        windowNotes.splice(migrationNoteOffset, migrationNotes.length, ...refreshedNotes);
+        migrationNotes = refreshedNotes;
         if (!composed.opened.length) throw new Error("No conversations are attachable after opening the terminal.");
       }
       if (composed.kernelLayout) windowNotes.push(viewportColumns === undefined
@@ -670,7 +677,7 @@ export async function openTerminalWindow(client: DaemonClient, view: string, req
       if (result.status >= 400) return { ...failed(result.data.error ?? `The daemon refused the view (HTTP ${result.status}).`), window, notes: windowNotes, absent: composed.absent, degraded: composed.degraded };
       if (!Array.isArray(result.data?.opened)) throw new Error("The terminal opened, but the daemon returned no view result. Inspect it before retrying.");
       if (session !== undefined && result.data.session !== session) throw new Error("The daemon's response did not confirm the selected Herdr session. Inspect the selected endpoint before retrying.");
-      return { ...result.data, window, notes: [...(result.data.notes ?? []), ...windowNotes, await shownNote()] };
+      return { ...result.data, window, notes: [...(result.data.notes ?? []), ...windowNotes.filter(note => !result.data.notes?.includes(note)), await shownNote()] };
     }
 
     if (typeof launchWindow !== "function") throw new Error("No terminal window launcher is available.");

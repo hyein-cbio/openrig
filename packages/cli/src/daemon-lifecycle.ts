@@ -235,6 +235,8 @@ export interface StartOptions {
   // into the daemon process env as OPENRIG_NO_KERNEL.
   skipKernelBoot?: boolean;
   allowDbConflict?: boolean;
+  /** Explicitly opt in or out. Bootstrap in the CLI caller, never in the detached daemon child. */
+  desktopTmux?: boolean;
 }
 
 export interface LifecycleDeps {
@@ -776,13 +778,21 @@ async function startOwnedDaemon(opts: StartOptions, deps: LifecycleDeps, lock: D
     throw new Error(`OpenRig instance initialization blocked: ${formatInstanceInitializationConflicts(initialization)}`);
   }
 
+  // Claim this instance and check for an existing daemon before touching tmux.
+  let baseEnv = process.env as Record<string, string>;
+  if (opts.desktopTmux !== undefined) {
+    if (opts.desktopTmux && db === ":memory:") throw new Error("Desktop tmux selection requires a persistent OpenRig instance.");
+    const { DESKTOP_TMUX_SOCKET_ENV, startDesktopTmuxServer } = await import("@openrig/daemon/tmux-server-start");
+    const socket = opts.desktopTmux ? (await startDesktopTmuxServer(OPENRIG_DIR)).socketPath : "off";
+    baseEnv = { ...baseEnv, [DESKTOP_TMUX_SOCKET_ENV]: socket };
+  }
   const logOffset = deps.fileSize?.(LOG_FILE) ?? Buffer.byteLength(deps.readFile(LOG_FILE) ?? "");
   const logFd = deps.openForAppend(LOG_FILE);
 
   let child: ChildProcess;
   try {
     child = deps.spawn(process.execPath, [daemonEntry], {
-    env: buildDaemonEnv(process.env as Record<string, string>, {
+    env: buildDaemonEnv(baseEnv, {
       port,
       host: explicitHost,
       db,

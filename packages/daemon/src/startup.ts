@@ -51,6 +51,7 @@ import { TmuxOptionDefaultsApplier } from "./domain/tmux-option-defaults.js";
 import { TmuxAdapter } from "./adapters/tmux.js";
 import { setDaemonTmuxControl, setDaemonTmuxServer, tmuxServerArgs } from "./adapters/tmux-server.js";
 import { selectTmuxServer, type TmuxServerMode } from "./domain/tmux-server-selection.js";
+import { RELEASED_ATTACHMENT_KIND_SQL } from "./domain/released-attachment-kind.js";
 import { CmuxAdapter } from "./adapters/cmux.js";
 import { execArgvCommand, execCommand, execTmuxCommand } from "./adapters/tmux-exec.js";
 import { tmuxControlExec } from "./adapters/tmux-control.js";
@@ -635,7 +636,13 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
       UNION SELECT s.session_name AS name FROM sessions s
       WHERE s.id = (SELECT latest.id FROM sessions latest WHERE latest.node_id = s.node_id
         ORDER BY datetime(latest.created_at) DESC, latest.rowid DESC LIMIT 1)
-        AND s.status <> 'exited'
+        AND s.status <> 'exited' AND s.intentionally_stopped = 0
+        AND NOT EXISTS (SELECT 1 FROM bindings b WHERE b.node_id = s.node_id
+          AND b.attachment_type = 'external_cli' AND b.external_session_name = s.session_name)
+        AND COALESCE(${RELEASED_ATTACHMENT_KIND_SQL}, 'unknown') <> 'external_cli'
+      UNION SELECT s.session_name AS name FROM sessions s
+        WHERE s.origin = 'claimed' AND s.status = 'detached' AND s.intentionally_stopped = 0
+          AND ${RELEASED_ATTACHMENT_KIND_SQL} = 'tmux'
     `).all() as Array<{ name: string }>).map(row => row.name).filter(Boolean),
   });
   if (tmuxSelection?.note) console.warn(`[tmux] ${tmuxSelection.note}`);
@@ -1698,6 +1705,7 @@ export async function createDaemon(opts?: DaemonOptions): Promise<DaemonResult> 
     teardownOrchestrator: new RigTeardownOrchestrator({
       db, rigRepo, sessionRegistry, tmuxAdapter, snapshotCapture, eventBus, resumeMetadataRefresher, serviceOrchestrator,
       claudeCollectorAssetPath,
+      confirmDesktopServerExit: tmuxSelection?.confirmDesktopExit,
       releaseClaimedSession: async (sessionId) => {
         const released = await rigLifecycleService.unclaimSession(sessionId);
         return released.ok ? { ok: true } : { ok: false, error: released.error };

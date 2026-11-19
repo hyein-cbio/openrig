@@ -58,6 +58,7 @@ import {
   sameIdSet,
 } from "./rig-viewer-records.js";
 import type { TmuxServerSelection } from "../tmux-server-selection.js";
+import { desktopTmuxMigrationNotes } from "../../tmux-server-start.js";
 // deriveViewMembers is a VALUE exported by the views store (not the composer).
 import { deriveViewMembers } from "./terminal-views-store.js";
 import type {
@@ -262,6 +263,11 @@ export interface TerminalServiceDeps {
 }
 
 /** The opened seats on another host, from the composed tiles: the complete list, so empty means all local. */
+function remoteTmuxMode() {
+  const selection = daemonTmuxServerInfo();
+  return selection?.remoteMode ?? selection?.mode;
+}
+
 function remoteOpened(composed: ComposedView, opened?: readonly string[]): Array<{ seat: string; host: string }> {
   return composed.opened.flatMap(pane => pane.host && (!opened || opened.includes(pane.seat)) ? [{ seat: pane.seat, host: pane.host }] : []);
 }
@@ -530,7 +536,9 @@ export class TerminalService {
     if (req.expectedPlan !== undefined && req.expectedPlan !== planId) {
       return errorResult(providerName, "preview_changed", "View membership, layout or provider session changed. Refresh the preview before Open; nothing was launched.");
     }
-    const notes = composedView.task ? [...composedView.task.issues] : composedView.kernelLayout ? [`Default kernel view: ${composedView.kernelLayout}.`] : [];
+    const notes = desktopTmuxMigrationNotes(daemonTmuxServerInfo());
+    if (composedView.task) notes.push(...composedView.task.issues);
+    else if (composedView.kernelLayout) notes.push(`Default kernel view: ${composedView.kernelLayout}.`);
     if (fellBack) notes.push(`Herdr isn't available here (not installed or not answering), so this view uses ${providerName}.`);
     if (composedView.kernelLayout && composedView.opened.length === 0) {
       return {
@@ -609,7 +617,7 @@ export class TerminalService {
       panesPerPage,
       localTmux: await this.resolveLocalTmux(),
       localTmuxServer: this.getTmuxServerArgs(),
-      localTmuxServerMode: daemonTmuxServerInfo()?.mode,
+      localTmuxServerMode: remoteTmuxMode(),
       ...(viewportColumns !== undefined ? { viewportColumns } : {}),
     });
     composed.rigName = identity.name;
@@ -628,7 +636,7 @@ export class TerminalService {
     const resolved = await this.resolveView(view);
     if ("code" in resolved) return resolved;
     const rigViewer = resolved.rigViewer === true;
-    const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: this.getTmuxServerArgs(), localTmuxServerMode: daemonTmuxServerInfo()?.mode });
+    const composed = composeView(resolved.id, await this.refineLiveness(resolved.members), { resolveHost: (id) => this.deps.resolveHost(id), panesPerPage: resolved.panesPerPage ?? panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: this.getTmuxServerArgs(), localTmuxServerMode: remoteTmuxMode() });
     if (resolved.rigName !== undefined) composed.rigName = resolved.rigName;
     const saved = view.startsWith("saved:") ? this.deps.viewsStore.get(view.slice(6))
       : !/^(qitem|mission|slice|pod|seat|rig):/.test(view) ? this.deps.viewsStore.get(view) : null;
@@ -1114,7 +1122,7 @@ export class TerminalService {
       const inventory = await this.deps.listRigSeatsBatch?.(result.rigIdentities.map(rig => rig.id));
       for (const entry of entries) {
         const rows = entry.kind === "derived" ? inventory?.get(entry.view.slice(4)) : undefined;
-        const plan = rows ? composeView(entry.view, await this.refineLiveness(deriveViewMembers(rows, { readOnly: false })), { resolveHost: id => this.deps.resolveHost(id), panesPerPage: this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: this.getTmuxServerArgs(), localTmuxServerMode: daemonTmuxServerInfo()?.mode })
+        const plan = rows ? composeView(entry.view, await this.refineLiveness(deriveViewMembers(rows, { readOnly: false })), { resolveHost: id => this.deps.resolveHost(id), panesPerPage: this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage, localTmux: await this.resolveLocalTmux(), localTmuxServer: this.getTmuxServerArgs(), localTmuxServerMode: remoteTmuxMode() })
           : await this.resolveComposed(entry.view, this.deps.resolveProvider(DEFAULT_PROVIDER)?.panesPerPage);
         if ("code" in plan) continue;
         result.catalog.push({ ...entry, members: [...plan.opened, ...plan.absent, ...plan.degraded].map((m) => m.seat), ready: plan.opened.length, absent: plan.absent.length, degraded: plan.degraded.length, pages: plan.pages.length });

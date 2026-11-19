@@ -69,7 +69,7 @@ describe("durable tmux server selection", () => {
     expect(fs.existsSync(path.join(home, "tmux-server.initialized"))).toBe(false);
   });
 
-  it.each(["not-json", "null", '{"version":2}', '{"version":1,"mode":"inherit","home":"/another/home","socketPath":"/another/server"}'])(
+  it.each(["not-json", "null", '{"version":3}', '{"version":1,"mode":"inherit","home":"/another/home","socketPath":"/another/server"}'])(
     "does not refuse inherit or overwrite an unusable advisory record: %s", async invalid => {
       await selectTmuxServer(options());
       const file = path.join(home, "tmux-server.json");
@@ -313,7 +313,7 @@ describe("durable tmux server selection", () => {
   it("does not overwrite an invalid or foreign-home server record", async () => {
     await selectTmuxServer(options());
     const file = path.join(home, "tmux-server.json");
-    const invalid = '{"version":2,"socketPath":"unknown"}';
+    const invalid = '{"version":3,"socketPath":"unknown"}';
     fs.writeFileSync(file, invalid);
     await expect(selectTmuxServer({ ...options(), mode: "isolated" })).rejects.toThrow("Invalid tmux server record");
     expect(fs.readFileSync(file, "utf8")).toBe(invalid);
@@ -357,7 +357,7 @@ describe("durable tmux server selection", () => {
   it("does not discard invalid pinned metadata just because its marker is gone", async () => {
     await selectTmuxServer({ ...options(), mode: "isolated" });
     const file = path.join(home, "tmux-server.json");
-    const invalid = { ...JSON.parse(fs.readFileSync(file, "utf8")), version: 2 };
+    const invalid = { ...JSON.parse(fs.readFileSync(file, "utf8")), version: 3 };
     fs.writeFileSync(file, JSON.stringify(invalid));
     fs.unlinkSync(path.join(home, "tmux-server.initialized"));
     await expect(selectTmuxServer(options())).rejects.toThrow("Invalid tmux server record");

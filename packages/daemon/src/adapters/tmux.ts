@@ -12,7 +12,7 @@ import { isTmuxCredentialEnvKey } from "./tmux-credential-env.js";
 import { addSeatRuntimeDir, seatRuntimeDir } from "../domain/seat-runtime-dir.js";
 import type { TmuxControlExec } from "./tmux-control.js";
 import { tmuxOnDaemonServer } from "./tmux-server.js";
-import { TMUX_SERVER_LIMIT_PREFIX } from "../tmux-server-start.js";
+import { DESKTOP_TMUX_SOCKET_FLAG, TMUX_SERVER_LIMIT_PREFIX } from "../tmux-server-start.js";
 
 export type ExecFn = (cmd: string) => Promise<string>;
 
@@ -98,7 +98,7 @@ export type ProcessLimitsMode = "fresh" | "recovery";
  *  capped (with its requested limit and the marker its command writes once it runs inside the scope), and (for the
  *  uncapped retry of a recovery) why the capped start failed. */
 interface ScopeNotices { processLimits?: SeatProcessLimitsNotice; capped?: boolean; requested?: SeatProcessLimits;
-  marker?: string; failedStart?: SeatProcessLimitsProblem }
+  marker?: string; failedStart?: SeatProcessLimitsProblem; launchScript?: string }
 
 /** How a capped launch sees its seat's scope start: the pane's process is in the seat scope and its command started
  *  there (started), or the pane died first, before the command started (systemd-run could not make the scope, also
@@ -1256,6 +1256,7 @@ export class TmuxAdapter {
       const restore = seatScope.length ? [...scopeMarkArgv(marker!), ...restoreEnvArgv({
         DBUS_SESSION_BUS_ADDRESS: selected.DBUS_SESSION_BUS_ADDRESS, XDG_RUNTIME_DIR: selected.XDG_RUNTIME_DIR })] : [];
       if (notices) {
+        notices.launchScript = file;
         notices.capped = seatScope.length > 0;
         if (marker) { notices.marker = marker; notices.requested = { ...(lookup as { limits: SeatProcessLimits }).limits }; }
       }
@@ -1573,6 +1574,7 @@ export class TmuxAdapter {
         throw error;
       }
     };
+    if (this.serverArgs[0] === DESKTOP_TMUX_SOCKET_FLAG) return source(false);
     if (!startServer || !this.userScopePossible()) return source(startServer);
     // #2710: `start-server` would start a missing server in the daemon's cgroup. Try on the running server first;
     // only when there is none, start it as startServer does (in the user scope) and run the command as before.
@@ -1583,6 +1585,20 @@ export class TmuxAdapter {
     }
     await this.startServer();
     return source(true);
+  }
+
+  private desktopServerUnavailable(): TmuxResult {
+    return { ok: false, code: "tmux_unavailable", message: "The desktop tmux server is unavailable. Check its socket, then deliberately restart with rig daemon start --desktop-tmux from a local macOS desktop terminal. The daemon will not replace it." };
+  }
+
+  /** A pane normally removes its own launch script. Only reap it if the desktop client's command could not reach tmux. */
+  private async failedLaunch(notices: ScopeNotices, error: unknown): Promise<TmuxResult> {
+    if (notices.marker) await this.fileOps.unlink(notices.marker).catch(() => {});
+    if (this.serverArgs[0] === DESKTOP_TMUX_SOCKET_FLAG && isServerMissingError(error)) {
+      if (notices.launchScript) await this.fileOps.unlink(notices.launchScript).catch(() => {});
+      return this.desktopServerUnavailable();
+    }
+    return classifyWriteError(error);
   }
 
   /** Ends the daemon's tmux control client, and with it its session (tmux-control.ts), when tmux is driven through one. */
@@ -1603,6 +1619,7 @@ export class TmuxAdapter {
     };
     try {
       if (await serverUp()) return { ok: true };
+      if (this.serverArgs[0] === DESKTOP_TMUX_SOCKET_FLAG) return this.desktopServerUnavailable();
       // #2710: on Linux, the server (and with it every seat) goes into a transient systemd --user scope of its own,
       // so stopping or restarting the daemon's unit no longer takes the seats with it. Any failure keeps the start below.
       if (await this.startServerInUserScope()) {
@@ -1919,8 +1936,7 @@ export class TmuxAdapter {
     try {
       printed = (await this.runEnvironmentCommand(argv, legacyParts.join(" "), true)).trim();
     } catch (err) {
-      if (notices.marker) await this.fileOps.unlink(notices.marker).catch(() => {});
-      return classifyWriteError(err);
+      return this.failedLaunch(notices, err);
     }
     // A capped launch reads its pane and identity from the same, first, printed line (a hook may print more after it).
     const firstLine = notices.capped ? (printed.split("\n")[0] ?? "").trim() : printed;
@@ -2478,8 +2494,7 @@ export class TmuxAdapter {
       }
       return this.launched(warnings, notices);
     } catch (err) {
-      if (notices.marker) await this.fileOps.unlink(notices.marker).catch(() => {});
-      return classifyWriteError(err);
+      return this.failedLaunch(notices, err);
     }
   }
 

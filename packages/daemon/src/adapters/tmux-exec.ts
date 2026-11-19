@@ -4,7 +4,7 @@ import { isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
 import { isTmuxCredentialEnvKey } from "./tmux-credential-env.js";
 import type { ArgvExecFn, ExecFn } from "./tmux.js";
-import { mayStartTmuxServer, reportTmuxServerLimit, TMUX_SERVER_LIMIT_PREFIX, tmuxServerStartCommand } from "../tmux-server-start.js";
+import { DESKTOP_TMUX_SOCKET_FLAG, mayStartTmuxServer, reportTmuxServerLimit, TMUX_SERVER_LIMIT_PREFIX, tmuxServerStartCommand } from "../tmux-server-start.js";
 
 const execAsync = promisify(exec);
 const execFileAsync = promisify(execFile);
@@ -26,7 +26,7 @@ function warnTmuxDeadline(err: unknown, started: number, argv: string[]): void {
   const failure = err as { killed?: boolean; signal?: string } | null;
   if (!failure?.killed || failure.signal !== "SIGKILL" || performance.now() - started < TMUX_EXEC_TIMEOUT_MS) return;
   let command = 1;
-  while (argv[command]?.startsWith("-")) command += ["-L", "-S", "-f", "-c", "-T"].includes(argv[command]!) ? 2 : 1;
+  while (argv[command]?.startsWith("-")) command += ["-L", "-S", DESKTOP_TMUX_SOCKET_FLAG, "-f", "-c", "-T"].includes(argv[command]!) ? 2 : 1;
   const paneTarget = argv.indexOf("-t", command + 1);
   const sessionTarget = ["new-session", "detach-client"].includes(argv[command] ?? "") ? argv.indexOf("-s", command + 1) : -1;
   const target = paneTarget >= 0 ? paneTarget : sessionTarget;

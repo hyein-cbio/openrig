@@ -1,5 +1,6 @@
 import { execFileSync } from "node:child_process";
 import Database from "better-sqlite3";
+import { DESKTOP_TMUX_SOCKET_FLAG } from "@openrig/daemon/tmux-server-start";
 
 export const DESTROY_CONFIRM_TOKEN = "destroy-openrig-state";
 
@@ -59,7 +60,8 @@ export interface DestroyDeps {
   removePath: (path: string) => void;
   mkdirp: (path: string) => void;
   listManagedTmuxSessions: (dbPath: string) => string[];
-  resolveTmuxServerArgs?: (stateRoot: string) => string[];
+  /** null means a pinned desktop server is confirmed exited; never fall back to the default server. */
+  resolveTmuxServerArgs?: (stateRoot: string) => string[] | null;
   killTmuxSession: (sessionName: string, serverArgs?: readonly string[]) => boolean;
   sleep: (ms: number) => Promise<void>;
   now: () => Date;
@@ -241,7 +243,9 @@ export async function executeDestroy(plan: DestroyPlan, deps: DestroyDeps): Prom
 
   let tmuxKilled = 0;
   let tmuxMissing = 0;
-  if (plan.scope === "all") {
+  if (serverArgs === null) {
+    tmuxMissing = plan.managedTmuxSessions.length;
+  } else if (plan.scope === "all") {
     for (const sessionName of plan.managedTmuxSessions) {
       if (deps.killTmuxSession(sessionName, serverArgs)) tmuxKilled += 1;
       else tmuxMissing += 1;
@@ -289,10 +293,17 @@ export function findListeningPidWithLsof(port: number): number | null {
 }
 
 export function killTmuxSessionWithCli(sessionName: string, serverArgs: readonly string[] = []): boolean {
+  const desktop = serverArgs[0] === DESKTOP_TMUX_SOCKET_FLAG;
   try {
-    execFileSync("tmux", [...serverArgs, "kill-session", "-t", `=${sessionName}`], { stdio: "ignore" });
+    execFileSync("tmux", [...serverArgs, "kill-session", "-t", `=${sessionName}`], desktop
+      ? { stdio: ["ignore", "ignore", "pipe"], encoding: "utf8", timeout: 5_000, killSignal: "SIGKILL" }
+      : { stdio: "ignore" });
     return true;
-  } catch {
+  } catch (err) {
+    const diagnostic = String((err as { stderr?: unknown }).stderr ?? "").trimStart();
+    if (desktop && !/^(?:can't find session|session not found|no sessions)\b/.test(diagnostic)) {
+      throw new Error(`Could not confirm cleanup of desktop tmux session ${sessionName}. Registration state was left untouched. Check the selected server before retrying.`);
+    }
     return false;
   }
 }

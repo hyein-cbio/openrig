@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { readRecordedTmuxServerArgs } from "../src/tmux-attachment.js";
+import { readRecordedTmuxServerArgs, readTmuxServerArgs } from "../src/tmux-attachment.js";
 import { selectTmuxServer } from "../../daemon/src/domain/tmux-server-selection.js";
 
 describe("offline tmux server selection", () => {
@@ -29,7 +29,7 @@ describe("offline tmux server selection", () => {
     it.each(["missing", "malformed", "invalid", "unreadable"])("handles a %s record without guessing a pinned socket", state => {
       writeFileSync(marker, pinned ? "openrig-tmux-pinned-v1\n" : "1\n");
       if (state === "malformed") writeFileSync(file, "{");
-      if (state === "invalid") writeFileSync(file, JSON.stringify({ version: 2 }));
+      if (state === "invalid") writeFileSync(file, JSON.stringify({ version: 3 }));
       if (state === "unreadable") mkdirSync(file);
       if (pinned) expect(() => readRecordedTmuxServerArgs(home)).toThrow(/tmux server record/);
       else expect(readRecordedTmuxServerArgs(home)).toEqual([]);
@@ -72,6 +72,16 @@ describe("offline tmux server selection", () => {
     expect(readRecordedTmuxServerArgs(home)).toEqual([]);
   });
 
+  it("retains the client-only flag on a desktop server for attach and offline cleanup", () => {
+    const socketPath = join(home, "desktop.sock");
+    const desktopCommandSocket = join(home, "c0123abcd");
+    writeFileSync(file, JSON.stringify({ version: 2, home: realpathSync(home), mode: "isolated", socketPath, pinned: true,
+      desktopServerPid: process.pid, desktopCommandSocket }));
+    expect(readRecordedTmuxServerArgs(home)).toEqual(["-NS", desktopCommandSocket]);
+    expect(readTmuxServerArgs(["-NS", socketPath])).toEqual(["-NS", socketPath]);
+    expect(() => readTmuxServerArgs(["-NS", "relative"])).toThrow("invalid tmux server options");
+  });
+
   it("keeps a legacy isolated record pinned even without the newer marker", () => {
     const socket = join(home, "isolated.sock");
     writeFileSync(file, JSON.stringify({ version: 1, home: realpathSync(home), mode: "isolated", socketPath: socket }));
@@ -79,7 +89,7 @@ describe("offline tmux server selection", () => {
   });
 
   it.each([
-    { version: 2 }, { home: "another-home" }, { mode: "unknown" }, { socketPath: "relative" }, { socketPath: "/bad\0socket" }, { pinned: false },
+    { version: 3 }, { home: "another-home" }, { mode: "unknown" }, { socketPath: "relative" }, { socketPath: "/bad\0socket" }, { pinned: false },
     { isolatedSocketPath: "relative" }, { isolatedSocketPath: "/bad\0socket" },
   ])("does not guess a server or overwrite an invalid record: %j", invalid => {
     const data = JSON.stringify({ version: 1, home: realpathSync(home), mode: "isolated", pinned: true, socketPath: join(home, "socket"), ...invalid });

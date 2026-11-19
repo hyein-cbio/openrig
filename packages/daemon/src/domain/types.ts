@@ -183,7 +183,7 @@ export type RigEvent =
   | { type: "node.removed"; rigId: string; nodeId: string }
   | { type: "binding.updated"; rigId: string; nodeId: string }
   | { type: "session.status_changed"; rigId: string; nodeId: string; status: string }
-  | { type: "session.detached"; rigId: string; nodeId: string; sessionName: string }
+  | { type: "session.detached"; rigId: string; nodeId: string; sessionName: string; sessionId?: string; releasedAttachmentType?: "tmux" | "external_cli" }
   // S5 (OPR.0.5.4.7) — seat-lifecycle audit trail: the three supported seat verbs each persist
   // their mutation with actor + reason in the same transaction as the mutation itself.
   | { type: "node.terminal_policy_changed"; rigId: string; nodeId: string; scope: "seat" | "rig_default"; config: unknown; actor: string; reason: string }
